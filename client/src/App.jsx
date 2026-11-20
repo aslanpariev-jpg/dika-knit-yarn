@@ -1,0 +1,110 @@
+import { Routes, Route, Navigate, Link, useNavigate, useLocation } from 'react-router-dom';
+import { useState, useEffect } from 'react';
+import Login from './pages/Login.jsx';
+import KnitterLogin from './pages/KnitterLogin.jsx';
+import AdminHome from './pages/AdminHome.jsx';
+import AdminDashboard from './pages/AdminDashboard.jsx';
+import AdminUsers from './pages/AdminUsers.jsx';
+import AdminYarns from './pages/AdminYarns.jsx';
+import AdminStock from './pages/AdminStock.jsx';
+import AdminOrders from './pages/AdminOrders.jsx';
+import KnitterHome from './pages/KnitterHome.jsx';
+import { getUser, clearAuth } from './api.js';
+
+function RequireRole({ role, children }) {
+  const user = getUser();
+  if (!user) return <Navigate to="/login" replace />;
+  if (role && user.role !== role && user.role !== 'ADMIN') return <Navigate to="/" replace />;
+  return children;
+}
+
+export default function App() {
+  const [, force] = useState(0);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const user = getUser();
+
+  useEffect(() => { force((n) => n + 1); }, [location.pathname]);
+
+  function logout() {
+    clearAuth();
+    navigate('/login', { replace: true });
+  }
+
+  // У грузчика больше нет веб-интерфейса — только Telegram.
+  // Если LOADER зашёл в веб, показываем страницу-заглушку.
+  const homePath =
+    user?.role === 'ADMIN' ? '/admin'
+    : user?.role === 'KNITTER' ? '/knitter'
+    : user?.role === 'LOADER' ? '/loader-info'
+    : '/login';
+
+  return (
+    <div className="min-h-full flex flex-col">
+      {user && (
+        <header className="bg-white border-b px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+          <Link to={homePath} className="font-semibold text-gray-800">
+            Пряжа · {user.name}
+          </Link>
+          <div className="flex items-center gap-2">
+            {user.role === 'ADMIN' && (
+              <>
+                <Link to="/admin" className="text-sm text-blue-600 px-2 py-2">Дашборд</Link>
+                <Link to="/admin/menu" className="text-sm text-gray-600 px-2 py-2">Меню</Link>
+              </>
+            )}
+            {user.role === 'KNITTER' && (
+              <Link to="/knitter" className="text-sm text-blue-600 px-2 py-2">Моя пряжа</Link>
+            )}
+            {user.role === 'LOADER' && (
+              <Link to="/loader-info" className="text-sm text-blue-600 px-2 py-2">Инструкция</Link>
+            )}
+            <button onClick={logout} className="text-sm text-red-600 px-2 py-2 rounded-lg active:bg-red-50">
+              Выйти
+            </button>
+          </div>
+        </header>
+      )}
+      <main className="flex-1">
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/knitter-login" element={<KnitterLogin />} />
+
+          {/* Грузчик: веб-интерфейса нет, работа только в Telegram */}
+          <Route path="/loader-info" element={<RequireRole role="LOADER"><LoaderInfo /></RequireRole>} />
+
+          {/* Вязальщик */}
+          <Route path="/knitter" element={<RequireRole role="KNITTER"><KnitterHome /></RequireRole>} />
+
+          {/* Отчёт для начальства */}
+          <Route path="/report" element={<AdminDashboard isReportMode={true} />} />
+
+          {/* Админ */}
+          <Route path="/admin" element={<RequireRole role="ADMIN"><AdminDashboard isReportMode={false} /></RequireRole>} />
+          <Route path="/admin/menu" element={<RequireRole role="ADMIN"><AdminHome /></RequireRole>} />
+          <Route path="/admin/users" element={<RequireRole role="ADMIN"><AdminUsers /></RequireRole>} />
+          <Route path="/admin/yarns" element={<RequireRole role="ADMIN"><AdminYarns /></RequireRole>} />
+          <Route path="/admin/stock" element={<RequireRole role="ADMIN"><AdminStock /></RequireRole>} />
+          <Route path="/admin/orders" element={<RequireRole role="ADMIN"><AdminOrders /></RequireRole>} />
+
+          <Route path="*" element={<Navigate to={user ? homePath : '/login'} replace />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+// Простая страница-заглушка для грузчика
+function LoaderInfo() {
+  return (
+    <div className="max-w-md mx-auto p-6 text-center">
+      <h1 className="text-xl font-semibold mb-3">Работа грузчика — в Telegram</h1>
+      <p className="text-gray-600 mb-4">
+        Заказы приходят в Telegram-группу грузчиков. Открой Telegram, найди группу и работай там.
+      </p>
+      <p className="text-gray-500 text-sm">
+        Если не привязан к боту — выбери себя в закреплённом сообщении группы.
+      </p>
+    </div>
+  );
+}
