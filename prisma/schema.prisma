@@ -184,3 +184,9 @@ model StockMovement {
   createdAt  DateTime  @default(now())
   @@index([yarnId, locationId])
 }
+
+// ─── НОВАЯ МОДЕЛЬ ДЛЯ ХРАНЕНИЯ НАСТРОЕК (ID ГРУППЫ) ───
+model Setting {
+  key   String @id
+  value String
+}
