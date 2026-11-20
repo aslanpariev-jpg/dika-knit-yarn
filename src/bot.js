@@ -54,14 +54,10 @@ async function postStockReport() {
 
 // ──────────────── Telegram (заказы) ────────────────
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-let TG_GROUP_ID = process.env.TELEGRAM_GROUP_ID || null; // Может быть null, если нет в .env
+let TG_GROUP_ID = process.env.TELEGRAM_GROUP_ID || null;
 
 let tgBot = null;
 let pinnedMessageId = null;
-
-function isConfigured() {
-  return Boolean(TG_TOKEN);
-}
 
 // Получить ID группы (из памяти или из БД)
 async function getGroupId() {
@@ -104,6 +100,32 @@ function startTelegram() {
     ctx.reply('Привет! Я бот учёта пряжи.\n\nЕсли ты грузчик — выбери себя в закреплённом сообщении в группе грузчиков.');
   });
 
+  // ─── КОМАНДА /setup ДЛЯ ГРУППЫ ───
+  tgBot.command('setup', async (ctx) => {
+    if (ctx.chat.type !== 'group' && ctx.chat.type !== 'supergroup') {
+      return ctx.reply('Эту команду нужно выполнять в группе грузчиков.');
+    }
+    
+    console.log(`[telegram] Получена команда /setup в группе ${ctx.chat.id}`);
+    await saveGroupId(ctx.chat.id);
+    
+    await ctx.reply('⏳ Настраиваю группу...');
+    await ensurePinnedMessage();
+  });
+
+  // Ловим любое сообщение в группе (на случай, если /setup не сработал)
+  tgBot.on('message', async (ctx, next) => {
+    if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+      const currentId = await getGroupId();
+      if (!currentId || String(ctx.chat.id) !== String(currentId)) {
+        console.log(`[telegram] Обнаружена новая группа! ID: ${ctx.chat.id}`);
+        await saveGroupId(ctx.chat.id);
+        await ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
+      }
+    }
+    return next();
+  });
+
   // /bind — ручная привязка
   tgBot.command('bind', async (ctx) => {
     const loaders = await prisma.user.findMany({
@@ -113,22 +135,6 @@ function startTelegram() {
     if (!loaders.length) return ctx.reply('Нет активных грузчиков.');
     const buttons = loaders.map((u) => Markup.button.callback(u.name, `bind:${u.id}`));
     await ctx.reply('Выбери себя:', Markup.inlineKeyboard(buttons, { columns: 2 }));
-  });
-
-  // Ловим любое сообщение в группе, чтобы узнать её ID
-  tgBot.on('message', async (ctx, next) => {
-    if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
-      const currentId = await getGroupId();
-      
-      // Если ID ещё нет или он не совпадает с тем, где сейчас пишут
-      if (!currentId || String(ctx.chat.id) !== String(currentId)) {
-        console.log(`[telegram] Обнаружена новая группа! ID: ${ctx.chat.id}`);
-        await saveGroupId(ctx.chat.id);
-        // Сразу закрепляем сообщение
-        await ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
-      }
-    }
-    return next();
   });
 
   // Callback: выбор грузчика
@@ -143,8 +149,6 @@ function startTelegram() {
       data: { telegramChatId: String(ctx.from.id) },
     });
     await ctx.answerCbQuery(`Ты привязан как ${user.name}`);
-    
-    // Обновляем закреплённое сообщение
     await refreshLoaderKeyboard().catch(() => {});
   });
 
@@ -240,7 +244,7 @@ function startTelegram() {
       if (id) {
         ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
       } else {
-        console.log('[telegram] Ожидаю первое сообщение в группе, чтобы узнать её ID...');
+        console.log('[telegram] Ожидаю команду /setup в группе или любое сообщение...');
       }
     })
     .catch((e) => console.error('[telegram] launch failed:', e.message));
@@ -257,13 +261,20 @@ function loadersListText(loaders) {
 async function ensurePinnedMessage() {
   if (!tgBot) return;
   const groupId = await getGroupId();
-  if (!groupId) return;
+  if (!groupId) {
+    console.log('[telegram] ensurePinnedMessage: ID группы не известен.');
+    return;
+  }
 
   const loaders = await prisma.user.findMany({
     where: { role: 'LOADER', active: true },
     orderBy: { name: 'asc' },
   });
-  if (!loaders.length) return;
+  
+  if (!loaders.length) {
+    console.log('[telegram] ensurePinnedMessage: В базе нет активных грузчиков (LOADER).');
+    return;
+  }
 
   const text =
     `👷 Выбор грузчика\n\n` +
@@ -281,7 +292,7 @@ async function ensurePinnedMessage() {
     pinnedMessageId = msg.message_id;
     console.log('[telegram] Закреплённое сообщение установлено');
   } catch (e) {
-    console.error('[telegram] ensurePinnedMessage:', e.message);
+    console.error('[telegram] Ошибка при закреплении (pinned failed):', e.message);
   }
 }
 
@@ -307,7 +318,6 @@ async function refreshLoaderKeyboard() {
   try {
     await tgBot.telegram.editMessageText(groupId, pinnedMessageId, undefined, text, keyboard);
   } catch (e) {
-    // Если не редактируется — пересоздаём
     await ensurePinnedMessage().catch(() => {});
   }
 }
@@ -338,12 +348,11 @@ function orderKeyboard(order) {
   ]);
 }
 
-// Уведомление о новом заказе
 async function notifyNewOrder(order) {
   if (!tgBot) return;
   const groupId = await getGroupId();
   if (!groupId) {
-    console.log('[telegram] Не могу отправить заказ: ID группы ещё не известен.');
+    console.log('[telegram] Не могу отправить заказ: ID группы ещё не известен. Выполните /setup в группе.');
     return;
   }
   const full = await prisma.order.findUnique({
@@ -359,7 +368,6 @@ async function notifyNewOrder(order) {
   );
 }
 
-// Уведомление об отмене
 async function notifyOrderCancelled(order, byWhom) {
   if (!tgBot) return;
   const groupId = await getGroupId();
@@ -379,12 +387,10 @@ async function notifyOrderCancelled(order, byWhom) {
 
 // ──────────────── Cron ────────────────
 function startCron() {
-  // Discord-отчёт в 09:00 МСК
   cron.schedule('0 9 * * *', () => {
     postStockReport().catch((e) => console.error('[cron] report failed', e.message));
   }, { timezone: 'Europe/Moscow' });
 
-  // Напоминания о PENDING-заказах каждые 10 минут (только в течение первого часа)
   cron.schedule('*/10 * * * *', () => {
     remindPendingOrders().catch((e) => console.error('[cron] remind failed', e.message));
   }, { timezone: 'Europe/Moscow' });
