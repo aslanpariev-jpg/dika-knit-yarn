@@ -54,13 +54,42 @@ async function postStockReport() {
 
 // ──────────────── Telegram (заказы) ────────────────
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_GROUP_ID = process.env.TELEGRAM_GROUP_ID; // ID группы грузчиков (например, -1001234567890)
+let TG_GROUP_ID = process.env.TELEGRAM_GROUP_ID || null; // Может быть null, если нет в .env
 
 let tgBot = null;
-let pinnedMessageId = null; // ID закреплённого сообщения с выбором грузчика
+let pinnedMessageId = null;
 
 function isConfigured() {
-  return Boolean(TG_TOKEN && TG_GROUP_ID);
+  return Boolean(TG_TOKEN);
+}
+
+// Получить ID группы (из памяти или из БД)
+async function getGroupId() {
+  if (TG_GROUP_ID) return TG_GROUP_ID;
+  try {
+    const setting = await prisma.setting.findUnique({ where: { key: 'telegram_group_id' } });
+    if (setting?.value) {
+      TG_GROUP_ID = setting.value;
+      console.log(`[telegram] ID группы подхвачен из базы: ${TG_GROUP_ID}`);
+      return TG_GROUP_ID;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Сохранить ID группы в БД
+async function saveGroupId(id) {
+  TG_GROUP_ID = String(id);
+  try {
+    await prisma.setting.upsert({
+      where: { key: 'telegram_group_id' },
+      update: { value: TG_GROUP_ID },
+      create: { key: 'telegram_group_id', value: TG_GROUP_ID },
+    });
+    console.log(`[telegram] ID группы сохранён в базу: ${TG_GROUP_ID}`);
+  } catch (e) {
+    console.error('[telegram] Ошибка сохранения ID группы:', e.message);
+  }
 }
 
 function startTelegram() {
@@ -70,15 +99,12 @@ function startTelegram() {
   }
   tgBot = new Telegraf(TG_TOKEN);
 
-  // /start в личке — просто подсказка
+  // /start в личке
   tgBot.start((ctx) => {
-    ctx.reply(
-      'Привет! Я бот учёта пряжи.\n\n' +
-      'Если ты грузчик — выбери себя в закреплённом сообщении в группе грузчиков.'
-    );
+    ctx.reply('Привет! Я бот учёта пряжи.\n\nЕсли ты грузчик — выбери себя в закреплённом сообщении в группе грузчиков.');
   });
 
-  // /bind — ручная привязка (на случай, если закреплённое сообщение устарело)
+  // /bind — ручная привязка
   tgBot.command('bind', async (ctx) => {
     const loaders = await prisma.user.findMany({
       where: { role: 'LOADER', active: true },
@@ -87,6 +113,22 @@ function startTelegram() {
     if (!loaders.length) return ctx.reply('Нет активных грузчиков.');
     const buttons = loaders.map((u) => Markup.button.callback(u.name, `bind:${u.id}`));
     await ctx.reply('Выбери себя:', Markup.inlineKeyboard(buttons, { columns: 2 }));
+  });
+
+  // Ловим любое сообщение в группе, чтобы узнать её ID
+  tgBot.on('message', async (ctx, next) => {
+    if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+      const currentId = await getGroupId();
+      
+      // Если ID ещё нет или он не совпадает с тем, где сейчас пишут
+      if (!currentId || String(ctx.chat.id) !== String(currentId)) {
+        console.log(`[telegram] Обнаружена новая группа! ID: ${ctx.chat.id}`);
+        await saveGroupId(ctx.chat.id);
+        // Сразу закрепляем сообщение
+        await ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
+      }
+    }
+    return next();
   });
 
   // Callback: выбор грузчика
@@ -101,16 +143,9 @@ function startTelegram() {
       data: { telegramChatId: String(ctx.from.id) },
     });
     await ctx.answerCbQuery(`Ты привязан как ${user.name}`);
-    await ctx.editMessageText(
-      `Закреплённое сообщение\n\n` +
-      `Выбери себя, чтобы получать заказы:\n\n` +
-      loadersListText(await prisma.user.findMany({ where: { role: 'LOADER', active: true }, orderBy: { name: 'asc' } })),
-      Markup.inlineKeyboard(
-        (await prisma.user.findMany({ where: { role: 'LOADER', active: true }, orderBy: { name: 'asc' } }))
-          .map((u) => Markup.button.callback(u.name, `bind:${u.id}`)),
-        { columns: 2 }
-      )
-    ).catch(() => {});
+    
+    // Обновляем закреплённое сообщение
+    await refreshLoaderKeyboard().catch(() => {});
   });
 
   // Callback: Привезти
@@ -178,23 +213,14 @@ function startTelegram() {
       include: { items: { include: { yarn: true } }, knitter: true },
     });
     if (!order || order.status !== 'PENDING') return ctx.answerCbQuery('Заказ уже неактуален', { show_alert: true });
+    if (!order.assignedLoaderId) return ctx.answerCbQuery('Сначала нажми «Привезти»', { show_alert: true });
 
-    // Привозить можно только после "Привезти"
-    if (!order.assignedLoaderId) {
-      return ctx.answerCbQuery('Сначала нажми «Привезти»', { show_alert: true });
-    }
-
-    // Транзакция: движения + статус
     const { createOrderDeliveryMovements } = require('./stock');
     const updated = await prisma.$transaction(async (tx) => {
       await createOrderDeliveryMovements(tx, order.id, order.items);
       return tx.order.update({
         where: { id: order.id },
-        data: {
-          status: 'DELIVERED',
-          deliveredAt: new Date(),
-          deliveredById: loader.id,
-        },
+        data: { status: 'DELIVERED', deliveredAt: new Date(), deliveredById: loader.id },
         include: { items: { include: { yarn: true } }, knitter: true },
       });
     });
@@ -206,11 +232,16 @@ function startTelegram() {
     ).catch(() => {});
   });
 
-  // Запуск + установка закреплённого сообщения при старте
+  // Запуск
   tgBot.launch()
-    .then(() => {
+    .then(async () => {
       console.log('[telegram] Бот запущен');
-      ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
+      const id = await getGroupId();
+      if (id) {
+        ensurePinnedMessage().catch((e) => console.error('[telegram] pinned failed:', e.message));
+      } else {
+        console.log('[telegram] Ожидаю первое сообщение в группе, чтобы узнать её ID...');
+      }
     })
     .catch((e) => console.error('[telegram] launch failed:', e.message));
 
@@ -218,12 +249,16 @@ function startTelegram() {
   process.once('SIGTERM', () => tgBot.stop('SIGTERM'));
 }
 
+// ──────────────── Вспомогательные функции ────────────────
 function loadersListText(loaders) {
   return loaders.map((u) => `• ${u.name}${u.telegramChatId ? ' ✅' : ''}`).join('\n');
 }
 
 async function ensurePinnedMessage() {
-  if (!tgBot || !TG_GROUP_ID) return;
+  if (!tgBot) return;
+  const groupId = await getGroupId();
+  if (!groupId) return;
+
   const loaders = await prisma.user.findMany({
     where: { role: 'LOADER', active: true },
     orderBy: { name: 'asc' },
@@ -241,8 +276,8 @@ async function ensurePinnedMessage() {
   );
 
   try {
-    const msg = await tgBot.telegram.sendMessage(TG_GROUP_ID, text, keyboard);
-    await tgBot.telegram.pinChatMessage(TG_GROUP_ID, msg.message_id, { disable_notification: true });
+    const msg = await tgBot.telegram.sendMessage(groupId, text, keyboard);
+    await tgBot.telegram.pinChatMessage(groupId, msg.message_id, { disable_notification: true });
     pinnedMessageId = msg.message_id;
     console.log('[telegram] Закреплённое сообщение установлено');
   } catch (e) {
@@ -250,9 +285,11 @@ async function ensurePinnedMessage() {
   }
 }
 
-// Обновить закреплённое сообщение (после сброса привязки админом)
 async function refreshLoaderKeyboard() {
-  if (!tgBot || !TG_GROUP_ID || !pinnedMessageId) return;
+  if (!tgBot) return;
+  const groupId = await getGroupId();
+  if (!groupId || !pinnedMessageId) return;
+
   const loaders = await prisma.user.findMany({
     where: { role: 'LOADER', active: true },
     orderBy: { name: 'asc' },
@@ -268,9 +305,9 @@ async function refreshLoaderKeyboard() {
     { columns: 2 }
   );
   try {
-    await tgBot.telegram.editMessageText(TG_GROUP_ID, pinnedMessageId, undefined, text, keyboard);
+    await tgBot.telegram.editMessageText(groupId, pinnedMessageId, undefined, text, keyboard);
   } catch (e) {
-    // Если сообщение нельзя редактировать — пересоздадим
+    // Если не редактируется — пересоздаём
     await ensurePinnedMessage().catch(() => {});
   }
 }
@@ -303,7 +340,12 @@ function orderKeyboard(order) {
 
 // Уведомление о новом заказе
 async function notifyNewOrder(order) {
-  if (!tgBot || !TG_GROUP_ID) return;
+  if (!tgBot) return;
+  const groupId = await getGroupId();
+  if (!groupId) {
+    console.log('[telegram] Не могу отправить заказ: ID группы ещё не известен.');
+    return;
+  }
   const full = await prisma.order.findUnique({
     where: { id: order.id },
     include: { items: { include: { yarn: true } }, knitter: true },
@@ -311,7 +353,7 @@ async function notifyNewOrder(order) {
   if (!full) return;
 
   await tgBot.telegram.sendMessage(
-    TG_GROUP_ID,
+    groupId,
     renderOrderText(full, 'Ожидает грузчика'),
     orderKeyboard(full)
   );
@@ -319,7 +361,10 @@ async function notifyNewOrder(order) {
 
 // Уведомление об отмене
 async function notifyOrderCancelled(order, byWhom) {
-  if (!tgBot || !TG_GROUP_ID) return;
+  if (!tgBot) return;
+  const groupId = await getGroupId();
+  if (!groupId) return;
+
   const full = await prisma.order.findUnique({
     where: { id: order.id },
     include: { items: { include: { yarn: true } }, knitter: true },
@@ -327,7 +372,7 @@ async function notifyOrderCancelled(order, byWhom) {
   if (!full) return;
 
   await tgBot.telegram.sendMessage(
-    TG_GROUP_ID,
+    groupId,
     renderOrderText(full, `❌ Отменён ${byWhom || ''}`.trim())
   );
 }
@@ -349,7 +394,10 @@ function startCron() {
 }
 
 async function remindPendingOrders() {
-  if (!tgBot || !TG_GROUP_ID) return;
+  if (!tgBot) return;
+  const groupId = await getGroupId();
+  if (!groupId) return;
+
   const now = Date.now();
   const oneHourAgo = new Date(now - 60 * 60 * 1000);
 
@@ -362,7 +410,7 @@ async function remindPendingOrders() {
   for (const order of pending) {
     try {
       await tgBot.telegram.sendMessage(
-        TG_GROUP_ID,
+        groupId,
         `⏰ Напоминание: заказ #${order.id.slice(-6)} всё ещё ожидает доставки\n\n` +
         renderOrderText(order, ''),
         orderKeyboard(order)
@@ -378,27 +426,19 @@ function startBot() {
   startDiscord();
   startTelegram();
 }
-// ──────────────── Остановка ботов (graceful shutdown) ────────────────
+
 function stopBot() {
   try {
-    if (tgBot) {
-      tgBot.stop('SIGTERM');
-      console.log('[telegram] Бот остановлен');
-    }
-  } catch (e) {
-    console.error('[telegram] stop error:', e.message);
-  }
+    if (tgBot) { tgBot.stop('SIGTERM'); console.log('[telegram] Бот остановлен'); }
+  } catch (e) { console.error('[telegram] stop error:', e.message); }
   try {
-    if (discordClient) {
-      discordClient.destroy();
-      console.log('[discord] Клиент остановлен');
-    }
-  } catch (e) {
-    console.error('[discord] stop error:', e.message);
-  }
+    if (discordClient) { discordClient.destroy(); console.log('[discord] Клиент остановлен'); }
+  } catch (e) { console.error('[discord] stop error:', e.message); }
 }
+
 module.exports = {
   startBot,
+  stopBot,
   startCron,
   postStockReport,
   notifyNewOrder,
