@@ -142,8 +142,20 @@ model Order {
   cancelledAt      DateTime?
   createdAt        DateTime    @default(now())
   items            OrderItem[]
+  telegramMessages TelegramOrderMessage[]
 
   @@index([status, createdAt])
+}
+
+model TelegramOrderMessage {
+  id        String   @id @default(cuid())
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String
+  chatId    String
+  messageId Int
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
 }
 
 enum OrderStatus {
