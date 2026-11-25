@@ -259,10 +259,7 @@ function startTelegram() {
     });
 
     await ctx.answerCbQuery('Доставлено!');
-    await ctx.editMessageText(
-      renderOrderText(updated, `✅ Доставлено (${loader.name})`),
-      undefined
-    ).catch(() => {});
+    await deleteOrderTelegramMessages(order.id, ctx.chat.id, ctx.callbackQuery.message.message_id);
   });
 
   // Запуск
@@ -390,11 +387,12 @@ async function notifyNewOrder(order) {
   });
   if (!full) return;
 
-  await tgBot.telegram.sendMessage(
+  const message = await tgBot.telegram.sendMessage(
     groupId,
     renderOrderText(full, 'Ожидает грузчика'),
     orderKeyboard(full)
   );
+  await saveOrderTelegramMessage(full.id, groupId, message);
 }
 
 async function notifyOrderCancelled(order, byWhom) {
@@ -420,12 +418,12 @@ function startCron() {
     postStockReport().catch((e) => console.error('[cron] report failed', e.message));
   }, { timezone: 'Europe/Moscow' });
 
-  cron.schedule('*/10 * * * *', () => {
+  cron.schedule('*/30 * * * *', () => {
     remindPendingOrders().catch((e) => console.error('[cron] remind failed', e.message));
   }, { timezone: 'Europe/Moscow' });
 
   console.log('[cron] Discord-отчёт: 09:00 Europe/Moscow');
-  console.log('[cron] Telegram-напоминания: каждые 10 минут');
+  console.log('[cron] Telegram-напоминания: каждые 30 минут, пока заказ не доставлен');
 }
 
 async function remindPendingOrders() {
@@ -433,27 +431,55 @@ async function remindPendingOrders() {
   const groupId = await getGroupId();
   if (!groupId) return;
 
-  const now = Date.now();
-  const oneHourAgo = new Date(now - 60 * 60 * 1000);
-
   const pending = await prisma.order.findMany({
-    where: { status: 'PENDING', createdAt: { gte: oneHourAgo } },
+    where: { status: 'PENDING' },
     include: { items: { include: { yarn: true } }, knitter: true },
     orderBy: { createdAt: 'asc' },
   });
 
   for (const order of pending) {
     try {
-      await tgBot.telegram.sendMessage(
+      const message = await tgBot.telegram.sendMessage(
         groupId,
         `⏰ Напоминание: заказ #${order.id.slice(-6)} всё ещё ожидает доставки\n\n` +
         renderOrderText(order, ''),
         orderKeyboard(order)
       );
+      await saveOrderTelegramMessage(order.id, groupId, message);
     } catch (e) {
       console.error('[cron] remind send failed:', e.message);
     }
   }
+}
+
+async function saveOrderTelegramMessage(orderId, chatId, message) {
+  await prisma.telegramOrderMessage.create({
+    data: { orderId, chatId: String(chatId), messageId: message.message_id },
+  });
+}
+
+async function deleteOrderTelegramMessages(orderId, currentChatId, currentMessageId) {
+  if (!tgBot) return;
+
+  const savedMessages = await prisma.telegramOrderMessage.findMany({ where: { orderId } });
+  const messages = new Map(savedMessages.map((message) => [
+    `${message.chatId}:${message.messageId}`,
+    { chatId: message.chatId, messageId: message.messageId },
+  ]));
+  messages.set(`${currentChatId}:${currentMessageId}`, {
+    chatId: String(currentChatId),
+    messageId: currentMessageId,
+  });
+
+  for (const message of messages.values()) {
+    try {
+      await tgBot.telegram.deleteMessage(message.chatId, message.messageId);
+    } catch (e) {
+      console.error(`[telegram] Не удалось удалить сообщение заказа ${orderId} (${message.messageId}):`, e.message);
+    }
+  }
+
+  await prisma.telegramOrderMessage.deleteMany({ where: { orderId } });
 }
 
 // ──────────────── Публичный API ────────────────
